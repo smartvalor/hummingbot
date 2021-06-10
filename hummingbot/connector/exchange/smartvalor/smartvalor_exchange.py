@@ -1,8 +1,9 @@
 from decimal import Decimal
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from hummingbot.connector.exchange.smartvalor.smartvalor_auth import \
     SmartvalorAuth
+from hummingbot.connector.exchange.smartvalor.smartvalor_order_book_tracker import SmartvalorOrderBookTracker
 from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.connector.in_flight_order_base import InFlightOrderBase
 from hummingbot.core.data_type.cancellation_result import CancellationResult
@@ -66,13 +67,12 @@ class SmartvalorExchange(ExchangeBase):
     def stop_tracking_order(self, order_id: str):
         pass
 
-    API_URL = "api.smartvalor.com"
-    EXCHANGE_NAME = "smartvalor"
-
     def __init__(self,
                  smartvalor_api_key: str,
                  smartvalor_secret_key: str,
-                 smartvalor_identitication: str
+                 smartvalor_identitication: str,
+                 trading_pairs: Optional[List[str]] = None,
                  ):
         super().__init__()
-        self.auth = SmartvalorAuth(smartvalor_api_key, smartvalor_secret_key, smartvalor_identitication)
+        self._auth = SmartvalorAuth(smartvalor_api_key, smartvalor_secret_key, smartvalor_identitication)
+        self._order_book_tracker = SmartvalorOrderBookTracker(self._auth, trading_pairs)

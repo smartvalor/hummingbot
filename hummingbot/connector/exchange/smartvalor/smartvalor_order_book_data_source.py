@@ -1,19 +1,32 @@
 import asyncio
-from typing import List, Dict
+import aiohttp
 
+from typing import List, Dict, Any
+from hummingbot.connector.exchange.smartvalor.smartvalor_auth import SmartvalorAuth
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+import hummingbot.connector.exchange.smartvalor.smartvalor_contants as constants
 
 
 class SmartvalorOrderBookDataSource(OrderBookTrackerDataSource):
 
-    def __init__(self, trading_pairs: List[str] = None):
+    def __init__(self, auth: SmartvalorAuth, trading_pairs: List[str] = None):
         super().__init__(trading_pairs)
-        self.trading_pairs = trading_pairs
+        self._trading_pairs = trading_pairs
+        self._auth = auth
 
     @staticmethod
     async def fetch_trading_pairs() -> List[str]:
-        pass
+        async with aiohttp.ClientSession() as client:
+            async with client.get(f"{constants.API_URL}/instruments", timeout=10) as response:
+                if response.status == 200:
+                    try:
+                        data: List[Dict[str, Any]] = await response.json()
+                        return list(map(lambda a: a["product1"]["isoCode"] + "-" + a["product2"]["isoCode"], data))
+                    except Exception:
+                        pass
+                        # do nothing
+                return []
 
     @classmethod
     async def get_last_traded_prices(cls, trading_pairs: List[str]) -> Dict[str, float]:
