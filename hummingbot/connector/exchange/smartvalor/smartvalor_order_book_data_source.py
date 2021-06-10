@@ -2,7 +2,6 @@ import asyncio
 import aiohttp
 
 from typing import List, Dict, Any
-from hummingbot.connector.exchange.smartvalor.smartvalor_auth import SmartvalorAuth
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 import hummingbot.connector.exchange.smartvalor.smartvalor_contants as constants
@@ -10,10 +9,9 @@ import hummingbot.connector.exchange.smartvalor.smartvalor_contants as constants
 
 class SmartvalorOrderBookDataSource(OrderBookTrackerDataSource):
 
-    def __init__(self, auth: SmartvalorAuth, trading_pairs: List[str] = None):
+    def __init__(self, trading_pairs: List[str] = None):
         super().__init__(trading_pairs)
-        self._trading_pairs = trading_pairs
-        self._auth = auth
+        self._trading_pairs: List[str] = trading_pairs
 
     @staticmethod
     async def fetch_trading_pairs() -> List[str]:
