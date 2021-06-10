@@ -1,8 +1,32 @@
-The OrderBookTrackerDataSource class is responsible for order book data retrieval. It simply collects, parses and queues the data stream to be processed by OrderBookTracker. Generally, this would mean pulling data from the exchange's API/WebSocket servers.
+import asyncio
+from typing import List, Dict
 
-To maintain a consistent and up-to-date order book, it is necessary to track the timestamp/nonce of each message received from the exchange API servers. Depending on the exchange responses, we can maintain an order book in the following ways:
+from hummingbot.core.data_type.order_book import OrderBook
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 
-Presence of Timestamp/Nonce
-In this ideal scenario, we will only 'apply' delta messages onto the order book if and only if the timestamp/nonce of the message received is above or +1 of _last_diff_uid in the order book.
-Absence of Timestamp/Nonce
-In this scenario, we would have to assign a timestamp to every message received from the exchange and similarly apply the delta messages sequentially only if it is received after the snapshot message and greater than the _last_diff_uid.
+
+class SmartvalorOrderBookDataSource(OrderBookTrackerDataSource):
+
+    def __init__(self, trading_pairs: List[str] = None):
+        super().__init__(trading_pairs)
+        self.trading_pairs = trading_pairs
+
+    @staticmethod
+    async def fetch_trading_pairs() -> List[str]:
+        pass
+
+    @classmethod
+    async def get_last_traded_prices(cls, trading_pairs: List[str]) -> Dict[str, float]:
+        pass
+
+    async def get_new_order_book(self, trading_pair: str) -> OrderBook:
+        pass
+
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
+        pass
+
+    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
+        pass
+
+    async def listen_for_trades(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
+        pass
