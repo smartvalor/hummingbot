@@ -1,12 +1,20 @@
-//his class is responsible for generating the appropriate authentication headers for the restricted REST endpoints to be used by the Exchange and UserStreamTracker class. Generally, this would mean that constructing the appropriate HTTP headers and authentication payload(as specified by the exchange's API documentation)
+from hummingbot.connector.exchange.smartvalor.smartvalor_auth import \
+    SmartvalorAuth
+from hummingbot.connector.exchange_base import ExchangeBase
 
-Some arguments tend to include:
 
-  HTTP Request Type
-Endpoint URL
-Mandatory parameters to pass on to the exchange (e.g. API key, secret, passphrase, request body)
-Depending on the specific exchange, different information may be needed for authentication. Typically, the Auth class will:
+class SmartvalorExchange(ExchangeBase):
+    """
+    SmartvalorExchange connects with Smartvalor exchange (smartvalor.com) and provides basic functionality for a connector
+    """
 
-Generate a timestamp/nonce.
-Generate a signature based on the time, access method, endpoint, provided parameters, and private key of the user.
-Compile the public key, timestamp, provided parameters, and signature into a dictionary to be passed via an http or ws request.
+    API_URL = "api.smartvalor.com"
+    EXCHANGE_NAME = "smartvalor"
+
+    def __init__(self,
+                 smartvalor_api_key: str,
+                 smartvalor_secret_key: str,
+                 smartvalor_identitication: str
+                 ):
+        super().__init__()
+        self.auth = SmartvalorAuth(smartvalor_api_key, smartvalor_secret_key, smartvalor_identitication)

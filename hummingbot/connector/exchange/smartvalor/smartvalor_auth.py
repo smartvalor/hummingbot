@@ -1,3 +1,40 @@
-Connector modules are centered around an Exchange class, which are children of ConnectorBase. Each Exchange class contains a OrderBookTracker and UserStreamTracker and they are responsible for maintaining the order books and user account information respectively.
+import hashlib
+import hmac
+import random
+from typing import Dict
 
-Exchange instances also contain a list of InFlightOrders, which are orders placed by Hummingbot that are currently on the order book. Typically, it is also helpful to have a exchange-specific Auth class, which generates the necessary authentication parameters/headers to access restricted REST endpoints and WebSocket channel, such as for placing orders and listening for order updates.
+
+class Signature:
+    def __init__(self, signature: str, nonce: int):
+        self.signature = signature
+        self.nonce = nonce
+
+
+class SmartvalorAuth:
+    def __init__(self, api_key: str, secret_key: str, identification: str):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.identification = identification
+
+    def get_headers(self) -> Dict[str, str]:
+        """
+        Generates headers for request
+        :return:
+        """
+        signature = self.get_signature()
+        return {
+            "accept": 'application/json',
+            "Content-Type": 'application/json',
+            "api-key": self.api_key,
+            "nonce": signature.nonce,
+            "signature": signature.signature,
+            "identification": self.identification
+        }
+
+    def get_signature(self) -> Signature:
+        nonce = random.randint(1, 100000000000000)
+        message = str(nonce) + self.identification + self.api_key
+        signature = hmac.new(self.secret_key.encode('UTF-8'), message, hashlib.sha256).hexdigest()
+        return Signature(signature, nonce)
+
+
