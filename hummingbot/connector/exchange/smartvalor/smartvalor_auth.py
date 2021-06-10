@@ -1,0 +1,3 @@
+Connector modules are centered around an Exchange class, which are children of ConnectorBase. Each Exchange class contains a OrderBookTracker and UserStreamTracker and they are responsible for maintaining the order books and user account information respectively.
+
+Exchange instances also contain a list of InFlightOrders, which are orders placed by Hummingbot that are currently on the order book. Typically, it is also helpful to have a exchange-specific Auth class, which generates the necessary authentication parameters/headers to access restricted REST endpoints and WebSocket channel, such as for placing orders and listening for order updates.
