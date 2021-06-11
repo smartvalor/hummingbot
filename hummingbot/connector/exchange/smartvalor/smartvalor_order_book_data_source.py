@@ -5,6 +5,7 @@ import aiohttp
 
 from typing import List, Dict, Any
 from hummingbot.core.data_type.order_book import OrderBook
+from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 import hummingbot.connector.exchange.smartvalor.smartvalor_contants as constants
 
@@ -41,7 +42,17 @@ class SmartvalorOrderBookDataSource(OrderBookTrackerDataSource):
         return result
 
     async def get_new_order_book(self, trading_pair: str) -> OrderBook:
-        pass
+        async with aiohttp.ClientSession() as client:
+            response = await client.get(f"{constants.API_URL}/v1/orderbook/{trading_pair.replace('-', '_')}&depth=100")
+            data: Dict[str, Any] = await response.json()
+            order_book = OrderBook()
+            bids: List[List[float]] = data["bids"]
+            asks: List[List[float]] = data["asks"]
+            timestamp = data["timestamp"]
+            bids_row = list(map(lambda row: OrderBookRow(row[0], row[1], timestamp), bids))
+            asks_row = list(map(lambda row: OrderBookRow(row[0], row[1], timestamp), asks))
+            order_book.apply_snapshot(bids_row, asks_row, timestamp)
+            return order_book
 
     async def listen_for_order_book_diffs(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
         pass
