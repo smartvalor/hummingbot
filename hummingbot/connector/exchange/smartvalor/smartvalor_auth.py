@@ -34,7 +34,7 @@ class SmartvalorAuth:
     def get_signature(self) -> Signature:
         nonce = random.randint(1, 100000000000000)
         message = str(nonce) + self._identification + self._api_key
-        signature = hmac.new(self._secret_key.encode('UTF-8'), message, hashlib.sha256).hexdigest()
+        signature = hmac.new(self._secret_key.encode('UTF-8'), message.encode('UTF-8'), hashlib.sha256).hexdigest()
         return Signature(signature, nonce)
 
 
