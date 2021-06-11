@@ -30,7 +30,15 @@ class SmartvalorOrderBookDataSource(OrderBookTrackerDataSource):
 
     @classmethod
     async def get_last_traded_prices(cls, trading_pairs: List[str]) -> Dict[str, float]:
-        pass
+        result = {}
+        async with aiohttp.ClientSession() as client:
+            response = await client.get(f"{constants.API_URL}/v1/ticker")
+            data: Dict[str, Any] = await response.json()
+            for t_pair in trading_pairs:
+                last_price = data[t_pair.replace("-", "_")]["last_price"]
+                if last_price is not None:
+                    result[t_pair] = last_price
+        return result
 
     async def get_new_order_book(self, trading_pair: str) -> OrderBook:
         pass
