@@ -41,6 +41,14 @@ class SmartvalorOrderBookDataSource(OrderBookTrackerDataSource):
                     result[t_pair] = last_price
         return result
 
+    async def get_snapshot(self, client: aiohttp.ClientSession, trading_pair: str) -> Dict[str, Any]:
+        """
+        Fetches order book snapshot for a particular trading pair from the exchange REST API.
+        :param client:
+        :param trading_pair:
+        :return:
+        """
+
     async def get_new_order_book(self, trading_pair: str) -> OrderBook:
         async with aiohttp.ClientSession() as client:
             response = await client.get(f"{constants.API_URL}/v1/orderbook/{trading_pair.replace('-', '_')}&depth=100")
