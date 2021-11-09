@@ -1,4 +1,5 @@
 import logging
+from enum import Enum
 from typing import (
     Dict,
     List,
@@ -35,24 +36,49 @@ from hummingbot.core.event.events import (
     TradeType,
     TradeFee
 )
-from hummingbot.connector.exchange_base import ExchangeBase
+from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.exchange.ascend_ex.ascend_ex_order_book_tracker import AscendExOrderBookTracker
 from hummingbot.connector.exchange.ascend_ex.ascend_ex_user_stream_tracker import AscendExUserStreamTracker
 from hummingbot.connector.exchange.ascend_ex.ascend_ex_auth import AscendExAuth
 from hummingbot.connector.exchange.ascend_ex.ascend_ex_in_flight_order import AscendExInFlightOrder
 from hummingbot.connector.exchange.ascend_ex import ascend_ex_utils
-from hummingbot.connector.exchange.ascend_ex.ascend_ex_constants import EXCHANGE_NAME, REST_URL
+from hummingbot.connector.exchange.ascend_ex import ascend_ex_constants as CONSTANTS
 from hummingbot.core.data_type.common import OpenOrder
+from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+
 ctce_logger = None
 s_decimal_NaN = Decimal("nan")
+s_decimal_0 = Decimal("0")
 
-
-AscendExTradingRule = namedtuple("AscendExTradingRule", "minNotional maxNotional")
 AscendExOrder = namedtuple("AscendExOrder", "symbol price orderQty orderType avgPx cumFee cumFilledQty errorCode feeAsset lastExecTime orderId seqNum side status stopPrice execInst")
 AscendExBalance = namedtuple("AscendExBalance", "asset availableBalance totalBalance")
 
 
-class AscendExExchange(ExchangeBase):
+class AscendExCommissionType(Enum):
+    BASE = 0
+    QUOTE = 1
+    RECEIVED = 2
+
+
+class AscendExTradingRule(TradingRule):
+    def __init__(self,
+                 trading_pair: str,
+                 min_price_increment: Decimal,
+                 min_base_amount_increment: Decimal,
+                 min_notional_size: Decimal,
+                 max_notional_size: Decimal,
+                 commission_type: AscendExCommissionType,
+                 commission_reserve_rate: Decimal):
+        super().__init__(trading_pair=trading_pair,
+                         min_price_increment=min_price_increment,
+                         min_base_amount_increment=min_base_amount_increment,
+                         min_notional_size=min_notional_size)
+        self.max_notional_size = max_notional_size
+        self.commission_type = commission_type
+        self.commission_reserve_rate = commission_reserve_rate
+
+
+class AscendExExchange(ExchangePyBase):
     """
     AscendExExchange connects with AscendEx exchange and provides order book pricing, user account tracking and
     trading functionality.
@@ -60,7 +86,7 @@ class AscendExExchange(ExchangeBase):
     API_CALL_TIMEOUT = 10.0
     SHORT_POLL_INTERVAL = 5.0
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
-    LONG_POLL_INTERVAL = 120.0
+    LONG_POLL_INTERVAL = 10.0
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -84,34 +110,35 @@ class AscendExExchange(ExchangeBase):
         super().__init__()
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self._shared_client = aiohttp.ClientSession()
+        self._throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
+        self._order_book_tracker = AscendExOrderBookTracker(shared_client=self._shared_client, throttler=self._throttler, trading_pairs=self._trading_pairs)
         self._ascend_ex_auth = AscendExAuth(ascend_ex_api_key, ascend_ex_secret_key)
-        self._order_book_tracker = AscendExOrderBookTracker(trading_pairs=trading_pairs)
-        self._user_stream_tracker = AscendExUserStreamTracker(self._ascend_ex_auth, trading_pairs)
-        self._ev_loop = asyncio.get_event_loop()
-        self._shared_client = None
+        self._user_stream_tracker = AscendExUserStreamTracker(shared_client=self._shared_client, throttler=self._throttler, ascend_ex_auth=self._ascend_ex_auth, trading_pairs=self._trading_pairs)
         self._poll_notifier = asyncio.Event()
         self._last_timestamp = 0
         self._in_flight_orders = {}  # Dict[client_order_id:str, AscendExInFlightOrder]
         self._order_not_found_records = {}  # Dict[client_order_id:str, count:int]
-        self._trading_rules = {}  # Dict[trading_pair:str, TradingRule]
-        self._ascend_ex_trading_rules = {}  # Dict[trading_pair:str, AscendExTradingRule]
+        self._trading_rules = {}  # Dict[trading_pair:str, AscendExTradingRule]
         self._status_polling_task = None
+        self._user_stream_tracker_task = None
         self._user_stream_event_listener_task = None
         self._trading_rules_polling_task = None
         self._last_poll_timestamp = 0
         self._account_group = None  # required in order to make post requests
         self._account_uid = None  # required in order to produce deterministic order ids
+        self._throttler = AsyncThrottler(rate_limits=CONSTANTS.RATE_LIMITS)
 
     @property
     def name(self) -> str:
-        return EXCHANGE_NAME
+        return CONSTANTS.EXCHANGE_NAME
 
     @property
     def order_books(self) -> Dict[str, OrderBook]:
         return self._order_book_tracker.order_books
 
     @property
-    def trading_rules(self) -> Dict[str, TradingRule]:
+    def trading_rules(self) -> Dict[str, AscendExTradingRule]:
         return self._trading_rules
 
     @property
@@ -126,7 +153,7 @@ class AscendExExchange(ExchangeBase):
         return {
             "order_books_initialized": self._order_book_tracker.ready,
             "account_balance": len(self._account_balances) > 0 if self._trading_required else True,
-            "trading_rule_initialized": len(self._trading_rules) > 0 and len(self._ascend_ex_trading_rules) > 0,
+            "trading_rule_initialized": len(self._trading_rules) > 0,
             "user_stream_initialized":
                 self._user_stream_tracker.data_source.last_recv_time > 0 if self._trading_required else True,
             "account_data": self._account_group is not None and self._account_uid is not None
@@ -196,6 +223,7 @@ class AscendExExchange(ExchangeBase):
         """
         self._order_book_tracker.start()
         await self._update_account_data()
+
         self._trading_rules_polling_task = safe_ensure_future(self._trading_rules_polling_loop())
         if self._trading_required:
             self._status_polling_task = safe_ensure_future(self._status_polling_loop())
@@ -206,6 +234,10 @@ class AscendExExchange(ExchangeBase):
         """
         This function is required by NetworkIterator base class and is called automatically.
         """
+        # Resets timestamps for status_polling_task
+        self._last_poll_timestamp = 0
+        self._last_timestamp = 0
+
         self._order_book_tracker.stop()
         if self._status_polling_task is not None:
             self._status_polling_task.cancel()
@@ -213,9 +245,6 @@ class AscendExExchange(ExchangeBase):
         if self._trading_rules_polling_task is not None:
             self._trading_rules_polling_task.cancel()
             self._trading_rules_polling_task = None
-        if self._status_polling_task is not None:
-            self._status_polling_task.cancel()
-            self._status_polling_task = None
         if self._user_stream_tracker_task is not None:
             self._user_stream_tracker_task.cancel()
             self._user_stream_tracker_task = None
@@ -230,20 +259,14 @@ class AscendExExchange(ExchangeBase):
         """
         try:
             # since there is no ping endpoint, the lowest rate call is to get BTC-USDT ticker
-            await self._api_request("get", "ticker")
+            await self._api_request(
+                method="get",
+                path_url=CONSTANTS.TICKER_PATH_URL)
         except asyncio.CancelledError:
             raise
         except Exception:
             return NetworkStatus.NOT_CONNECTED
         return NetworkStatus.CONNECTED
-
-    async def _http_client(self) -> aiohttp.ClientSession:
-        """
-        :returns Shared client session instance
-        """
-        if self._shared_client is None:
-            self._shared_client = aiohttp.ClientSession()
-        return self._shared_client
 
     async def _trading_rules_polling_loop(self):
         """
@@ -263,17 +286,16 @@ class AscendExExchange(ExchangeBase):
                 await asyncio.sleep(0.5)
 
     async def _update_trading_rules(self):
-        instruments_info = await self._api_request("get", path_url="products")
-        [trading_rules, ascend_ex_trading_rules] = self._format_trading_rules(instruments_info)
+        instruments_info = await self._api_request(
+            method="get",
+            path_url=CONSTANTS.PRODUCTS_PATH_URL)
         self._trading_rules.clear()
-        self._trading_rules = trading_rules
-        self._ascend_ex_trading_rules.clear()
-        self._ascend_ex_trading_rules = ascend_ex_trading_rules
+        self._trading_rules = self._format_trading_rules(instruments_info)
 
     def _format_trading_rules(
         self,
         instruments_info: Dict[str, Any]
-    ) -> [Dict[str, TradingRule], Dict[str, Dict[str, AscendExTradingRule]]]:
+    ) -> Dict[str, AscendExTradingRule]:
         """
         Converts json API response into a dictionary of trading rules.
         :param instruments_info: The json API response
@@ -299,30 +321,29 @@ class AscendExExchange(ExchangeBase):
         }
         """
         trading_rules = {}
-        ascend_ex_trading_rules = {}
         for rule in instruments_info["data"]:
             try:
                 trading_pair = ascend_ex_utils.convert_from_exchange_trading_pair(rule["symbol"])
-                trading_rules[trading_pair] = TradingRule(
+                trading_rules[trading_pair] = AscendExTradingRule(
                     trading_pair,
                     min_price_increment=Decimal(rule["tickSize"]),
-                    min_base_amount_increment=Decimal(rule["lotSize"])
-                )
-                ascend_ex_trading_rules[trading_pair] = AscendExTradingRule(
-                    minNotional=Decimal(rule["minNotional"]),
-                    maxNotional=Decimal(rule["maxNotional"])
+                    min_base_amount_increment=Decimal(rule["lotSize"]),
+                    min_notional_size=Decimal(rule["minNotional"]),
+                    max_notional_size=Decimal(rule["maxNotional"]),
+                    commission_type=AscendExCommissionType[rule["commissionType"].upper()],
+                    commission_reserve_rate=Decimal(rule["commissionReserveRate"]),
                 )
             except Exception:
                 self.logger().error(f"Error parsing the trading pair rule {rule}. Skipping.", exc_info=True)
-        return [trading_rules, ascend_ex_trading_rules]
+        return trading_rules
 
     async def _update_account_data(self):
         headers = {
             **self._ascend_ex_auth.get_headers(),
             **self._ascend_ex_auth.get_auth_headers("info"),
         }
-        url = f"{REST_URL}/info"
-        response = await aiohttp.ClientSession().get(url, headers=headers)
+        url = f"{CONSTANTS.REST_URL}/info"
+        response = await self._shared_client.get(url, headers=headers)
 
         try:
             parsed_response = json.loads(await response.text())
@@ -340,7 +361,8 @@ class AscendExExchange(ExchangeBase):
     async def _api_request(self,
                            method: str,
                            path_url: str,
-                           params: Dict[str, Any] = {},
+                           params: Optional[Dict[str, Any]] = None,
+                           data: Optional[Dict[str, Any]] = None,
                            is_auth_required: bool = False,
                            force_auth_path_url: Optional[str] = None
                            ) -> Dict[str, Any]:
@@ -352,52 +374,47 @@ class AscendExExchange(ExchangeBase):
         signature to the request.
         :returns A response in json format.
         """
-        url = None
-        headers = None
+        kwargs = {}
+        if params:
+            kwargs["params"] = params
+        if data:
+            kwargs["data"] = json.dumps(data)
 
         if is_auth_required:
-            if (self._account_group) is None:
+            if self._account_group is None:
                 await self._update_account_data()
 
             url = f"{ascend_ex_utils.get_rest_url_private(self._account_group)}/{path_url}"
-            headers = {
+            kwargs["headers"] = {
                 **self._ascend_ex_auth.get_headers(),
                 **self._ascend_ex_auth.get_auth_headers(
                     path_url if force_auth_path_url is None else force_auth_path_url
                 ),
             }
         else:
-            url = f"{REST_URL}/{path_url}"
-            headers = self._ascend_ex_auth.get_headers()
+            url = f"{CONSTANTS.REST_URL}/{path_url}"
+            kwargs["headers"] = self._ascend_ex_auth.get_headers()
 
-        client = await self._http_client()
         if method == "get":
-            response = await client.get(
-                url,
-                headers=headers
-            )
+            async with self._throttler.execute_task(path_url):
+                response = await self._shared_client.get(url, **kwargs)
         elif method == "post":
-            response = await client.post(
-                url,
-                headers=headers,
-                data=json.dumps(params)
-            )
+            async with self._throttler.execute_task(path_url):
+                response = await self._shared_client.post(url, **kwargs)
         elif method == "delete":
-            response = await client.delete(
-                url,
-                headers=headers,
-                data=json.dumps(params)
-            )
+            async with self._throttler.execute_task(path_url):
+                response = await self._shared_client.delete(url, **kwargs)
         else:
             raise NotImplementedError
 
-        try:
-            parsed_response = json.loads(await response.text())
-        except Exception as e:
-            raise IOError(f"Error parsing data from {url}. Error: {str(e)}")
+        resp_text = await response.text()
         if response.status != 200:
-            raise IOError(f"Error fetching data from {url}. HTTP status is {response.status}. "
-                          f"Message: {parsed_response}")
+            raise IOError(f"Error calling {url}. HTTP status is {response.status}. "
+                          f"Message: {resp_text}")
+        try:
+            parsed_response = json.loads(resp_text)
+        except Exception as e:
+            raise IOError(f"Error calling {url}. Error: {str(e)}")
         if parsed_response["code"] != 0:
             raise IOError(f"{url} API call failed, response: {parsed_response}")
 
@@ -480,73 +497,78 @@ class AscendExExchange(ExchangeBase):
         """
         if not order_type.is_limit_type():
             raise Exception(f"Unsupported order type: {order_type}")
-        ascend_ex_trading_rule = self._ascend_ex_trading_rules[trading_pair]
-
         amount = self.quantize_order_amount(trading_pair, amount)
         price = self.quantize_order_price(trading_pair, price)
-
+        if amount <= s_decimal_0:
+            raise ValueError("Order amount must be greater than zero.")
         try:
-            # ascend_ex has a unique way of determening if the order has enough "worth" to be posted
-            # see https://ascendex.github.io/ascendex-pro-api/#place-order
-            notional = Decimal(price * amount)
-            if notional < ascend_ex_trading_rule.minNotional or notional > ascend_ex_trading_rule.maxNotional:
-                raise ValueError(f"Notional amount {notional} is not withing the range of {ascend_ex_trading_rule.minNotional}-{ascend_ex_trading_rule.maxNotional}.")
-
-            # TODO: check balance
-            [exchange_order_id, timestamp] = ascend_ex_utils.gen_exchange_order_id(self._account_uid, order_id)
-
+            timestamp = ascend_ex_utils.get_ms_timestamp()
             api_params = {
-                "id": exchange_order_id,
+                "id": order_id,
                 "time": timestamp,
                 "symbol": ascend_ex_utils.convert_to_exchange_trading_pair(trading_pair),
                 "orderPrice": f"{price:f}",
                 "orderQty": f"{amount:f}",
                 "orderType": "limit",
-                "side": trade_type.name
+                "side": "buy" if trade_type == TradeType.BUY else "sell",
+                "respInst": "ACCEPT",
             }
-
             self.start_tracking_order(
                 order_id,
-                exchange_order_id,
+                None,
                 trading_pair,
                 trade_type,
                 price,
                 amount,
                 order_type
             )
+            resp = await self._api_request(
+                method="post",
+                path_url=CONSTANTS.ORDER_PATH_URL,
+                data=api_params,
+                is_auth_required=True,
+                force_auth_path_url="order")
+            exchange_order_id = str(resp["data"]["info"]["orderId"])
+            tracked_order: AscendExInFlightOrder = self._in_flight_orders.get(order_id)
+            tracked_order.update_exchange_order_id(exchange_order_id)
+            if resp["data"]["status"] == "Ack":
+                # Ack status means the server has received the request
+                return
+            tracked_order.update_status(resp["data"]["info"]["status"])
+            if tracked_order.is_failure:
+                raise Exception(f'Failed to create an order, reason: {resp["data"]["info"]["errorCode"]}')
 
-            await self._api_request("post", "cash/order", api_params, True, force_auth_path_url="order")
-            tracked_order = self._in_flight_orders.get(order_id)
-
-            if tracked_order is not None:
-                self.logger().info(f"Created {order_type.name} {trade_type.name} order {order_id} for "
-                                   f"{amount} {trading_pair}.")
-
-            event_tag = MarketEvent.BuyOrderCreated if trade_type is TradeType.BUY else MarketEvent.SellOrderCreated
-            event_class = BuyOrderCreatedEvent if trade_type is TradeType.BUY else SellOrderCreatedEvent
-            self.trigger_event(event_tag,
-                               event_class(
-                                   self.current_timestamp,
-                                   order_type,
-                                   trading_pair,
-                                   amount,
-                                   price,
-                                   order_id,
-                                   exchange_order_id=exchange_order_id
-                               ))
+            self.logger().info(f"Created {order_type.name} {trade_type.name} order {order_id} for "
+                               f"{amount} {trading_pair}.")
+            self.trigger_order_created_event(tracked_order)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception:
             self.stop_tracking_order(order_id)
+            msg = f"Error submitting {trade_type.name} {order_type.name} order to AscendEx for " \
+                  f"{amount} {trading_pair} " \
+                  f"{price}."
             self.logger().network(
-                f"Error submitting {trade_type.name} {order_type.name} order to AscendEx for "
-                f"{amount} {trading_pair} "
-                f"{price}.",
+                msg,
                 exc_info=True,
-                app_warning_msg=str(e)
+                app_warning_msg=msg
             )
             self.trigger_event(MarketEvent.OrderFailure,
                                MarketOrderFailureEvent(self.current_timestamp, order_id, order_type))
+
+    def trigger_order_created_event(self, order: AscendExInFlightOrder):
+        event_tag = MarketEvent.BuyOrderCreated if order.trade_type is TradeType.BUY else MarketEvent.SellOrderCreated
+        event_class = BuyOrderCreatedEvent if order.trade_type is TradeType.BUY else SellOrderCreatedEvent
+        self.trigger_event(event_tag,
+                           event_class(
+                               self.current_timestamp,
+                               order.order_type,
+                               order.trading_pair,
+                               order.amount,
+                               order.price,
+                               order.client_order_id,
+                               exchange_order_id=order.exchange_order_id
+                           ))
 
     def start_tracking_order(self,
                              order_id: str,
@@ -591,15 +613,17 @@ class AscendExExchange(ExchangeBase):
             if tracked_order.exchange_order_id is None:
                 await tracked_order.get_exchange_order_id()
             ex_order_id = tracked_order.exchange_order_id
+
+            api_params = {
+                "symbol": ascend_ex_utils.convert_to_exchange_trading_pair(trading_pair),
+                "orderId": ex_order_id,
+                "time": ascend_ex_utils.get_ms_timestamp()
+            }
             await self._api_request(
-                "delete",
-                "cash/order",
-                {
-                    "symbol": ascend_ex_utils.convert_to_exchange_trading_pair(trading_pair),
-                    "orderId": ex_order_id,
-                    "time": ascend_ex_utils.get_ms_timestamp()
-                },
-                True,
+                method="delete",
+                path_url=CONSTANTS.ORDER_PATH_URL,
+                data=api_params,
+                is_auth_required=True,
                 force_auth_path_url="order"
             )
 
@@ -625,7 +649,6 @@ class AscendExExchange(ExchangeBase):
         """
         while True:
             try:
-                self._poll_notifier = asyncio.Event()
                 await self._poll_notifier.wait()
                 await safe_gather(
                     self._update_balances(),
@@ -641,12 +664,18 @@ class AscendExExchange(ExchangeBase):
                                       app_warning_msg="Could not fetch account updates from AscendEx. "
                                                       "Check API key and network connection.")
                 await asyncio.sleep(0.5)
+            finally:
+                self._poll_notifier = asyncio.Event()
 
     async def _update_balances(self):
         """
         Calls REST API to update total and available balances.
         """
-        response = await self._api_request("get", "cash/balance", {}, True, force_auth_path_url="balance")
+        response = await self._api_request(
+            method="get",
+            path_url=CONSTANTS.BALANCE_PATH_URL,
+            is_auth_required=True,
+            force_auth_path_url="balance")
         balances = list(map(
             lambda balance: AscendExBalance(
                 balance["asset"],
@@ -665,45 +694,57 @@ class AscendExExchange(ExchangeBase):
         current_tick = int(self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL)
 
         if current_tick > last_tick and len(self._in_flight_orders) > 0:
-            tracked_orders = list(self._in_flight_orders.values())
-            tasks = []
-            for tracked_order in tracked_orders:
-                order_id = await tracked_order.get_exchange_order_id()
-                tasks.append(self._api_request(
-                    "get",
-                    f"cash/order/status?orderId={order_id}",
-                    {},
-                    True,
-                    force_auth_path_url="order/status")
+            tracked_orders: List[AscendExInFlightOrder] = list(self._in_flight_orders.values())
+            for o in tracked_orders:
+                await o.get_exchange_order_id()
+            order_ids: str = ",".join(o.exchange_order_id for o in tracked_orders)
+            params = {"orderId": order_ids}
+            resp = await self._api_request(
+                method="get",
+                path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
+                params=params,
+                is_auth_required=True,
+                force_auth_path_url="order/status"
+            )
+            self.logger().debug(f"Polling for order status updates of {len(order_ids)} orders.")
+            self.logger().debug(f"cash/order/status?orderId={order_ids} response: {resp}")
+            # The data returned from this end point can be either a list or a dict depending on number of orders
+            resp_records: List = []
+            if isinstance(resp["data"], dict):
+                resp_records.append(resp["data"])
+            elif isinstance(resp["data"], list):
+                resp_records = resp["data"]
+            ascend_ex_orders: List[AscendExOrder] = []
+            try:
+                for order_data in resp_records:
+                    ascend_ex_orders.append(AscendExOrder(
+                        order_data["symbol"],
+                        order_data["price"],
+                        order_data["orderQty"],
+                        order_data["orderType"],
+                        order_data["avgPx"],
+                        order_data["cumFee"],
+                        order_data["cumFilledQty"],
+                        order_data["errorCode"],
+                        order_data["feeAsset"],
+                        order_data["lastExecTime"],
+                        order_data["orderId"],
+                        order_data["seqNum"],
+                        order_data["side"],
+                        order_data["status"],
+                        order_data["stopPrice"],
+                        order_data["execInst"]
+                    ))
+                for order in ascend_ex_orders:
+                    self._process_order_message(order)
+                for hbot_order in tracked_orders:
+                    if hbot_order.exchange_order_id not in (o.orderId for o in ascend_ex_orders):
+                        self.logger().info(f"{hbot_order} is missing from expected response ({resp})")
+            except Exception:
+                self.logger().info(
+                    f"Unexpected error during processing order status. The Ascend Ex Response: {resp}",
+                    exc_info=True
                 )
-            self.logger().debug(f"Polling for order status updates of {len(tasks)} orders.")
-            responses = await safe_gather(*tasks, return_exceptions=True)
-            for response in responses:
-                if isinstance(response, Exception):
-                    raise response
-                if "data" not in response:
-                    self.logger().info(f"_update_order_status result not in resp: {response}")
-                    continue
-
-                order_data = response.get("data")
-                self._process_order_message(AscendExOrder(
-                    order_data["symbol"],
-                    order_data["price"],
-                    order_data["orderQty"],
-                    order_data["orderType"],
-                    order_data["avgPx"],
-                    order_data["cumFee"],
-                    order_data["cumFilledQty"],
-                    order_data["errorCode"],
-                    order_data["feeAsset"],
-                    order_data["lastExecTime"],
-                    order_data["orderId"],
-                    order_data["seqNum"],
-                    order_data["side"],
-                    order_data["status"],
-                    order_data["stopPrice"],
-                    order_data["execInst"]
-                ))
 
     async def cancel_all(self, timeout_seconds: float):
         """
@@ -714,17 +755,31 @@ class AscendExExchange(ExchangeBase):
         """
         cancellation_results = []
         try:
+            tracked_orders: Dict[str, AscendExInFlightOrder] = self._in_flight_orders.copy()
+
+            api_params = {
+                "orders": [
+                    {
+                        'id': ascend_ex_utils.uuid32(),
+                        "orderId": await order.get_exchange_order_id(),
+                        "symbol": ascend_ex_utils.convert_to_exchange_trading_pair(order.trading_pair),
+                        "time": int(time.time() * 1e3)
+                    }
+                    for order in tracked_orders.values()
+                ]
+            }
+
             await self._api_request(
-                "delete",
-                "cash/order/all",
-                {},
-                True,
-                force_auth_path_url="order/all"
+                method="delete",
+                path_url=CONSTANTS.ORDER_BATCH_PATH_URL,
+                data=api_params,
+                is_auth_required=True,
+                force_auth_path_url="order/batch"
             )
 
             open_orders = await self.get_open_orders()
 
-            for cl_order_id, tracked_order in self._in_flight_orders.copy().items():
+            for cl_order_id, tracked_order in tracked_orders.items():
                 open_order = [o for o in open_orders if o.client_order_id == cl_order_id]
                 if not open_order:
                     cancellation_results.append(CancellationResult(cl_order_id, True))
@@ -764,13 +819,16 @@ class AscendExExchange(ExchangeBase):
                 order_side: TradeType,
                 amount: Decimal,
                 price: Decimal = s_decimal_NaN) -> TradeFee:
-        """
-        To get trading fee, this function is simplified by using fee override configuration. Most parameters to this
-        function are ignore except order_type. Use OrderType.LIMIT_MAKER to specify you want trading fee for
-        maker order.
-        """
-        is_maker = order_type is OrderType.LIMIT_MAKER
-        return TradeFee(percent=self.estimate_fee_pct(is_maker))
+        """For more information: https://ascendex.github.io/ascendex-pro-api/#place-order."""
+        trading_pair = f"{base_currency}-{quote_currency}"
+        trading_rule = self._trading_rules[trading_pair]
+        fee_percent = Decimal("0")
+        if order_side == TradeType.BUY:
+            if trading_rule.commission_type == AscendExCommissionType.QUOTE:
+                fee_percent = trading_rule.commission_reserve_rate
+        elif trading_rule.commission_type == AscendExCommissionType.BASE:
+            fee_percent = trading_rule.commission_reserve_rate
+        return TradeFee(percent=fee_percent)
 
     async def _iter_user_event_queue(self) -> AsyncIterable[Dict[str, any]]:
         while True:
@@ -845,16 +903,17 @@ class AscendExExchange(ExchangeBase):
 
     async def get_open_orders(self) -> List[OpenOrder]:
         result = await self._api_request(
-            "get",
-            "cash/order/open",
-            {},
-            True,
+            method="get",
+            path_url=CONSTANTS.ORDER_OPEN_PATH_URL,
+            is_auth_required=True,
             force_auth_path_url="order/open"
         )
         ret_val = []
         for order in result["data"]:
-            if order["type"] != "LIMIT":
-                raise Exception(f"Unsupported order type {order['type']}")
+            if order["orderType"].lower() != "limit":
+                self.logger().debug(f"Unsupported orderType: {order['orderType']}. Order: {order}",
+                                    exc_info=True)
+                continue
 
             exchange_order_id = order["orderId"]
             client_order_id = None
@@ -863,7 +922,8 @@ class AscendExExchange(ExchangeBase):
                     client_order_id = in_flight_order.client_order_id
 
             if client_order_id is None:
-                raise Exception(f"Client order id for {exchange_order_id} not found.")
+                self.logger().debug(f"Unrecognized Order {exchange_order_id}: {order}")
+                continue
 
             ret_val.append(
                 OpenOrder(
@@ -896,38 +956,20 @@ class AscendExExchange(ExchangeBase):
         if client_order_id is None:
             return
 
-        tracked_order = self._in_flight_orders[client_order_id]
+        tracked_order: AscendExInFlightOrder = self._in_flight_orders[client_order_id]
+        # This could happen for Ack request type when placing new order, we don't know if the order is open until
+        # we get order status update
+        if tracked_order.is_locally_new and AscendExInFlightOrder.is_open_status(order_msg.status):
+            self.trigger_order_created_event(tracked_order)
+        tracked_order.update_status(order_msg.status)
 
-        # update order
-        tracked_order.last_state = order_msg.status
-        tracked_order.fee_paid = Decimal(order_msg.cumFee)
-        tracked_order.fee_asset = order_msg.feeAsset
-        tracked_order.executed_amount_base = Decimal(order_msg.cumFilledQty)
-        tracked_order.executed_amount_quote = Decimal(order_msg.price) * Decimal(order_msg.cumFilledQty)
+        if tracked_order.executed_amount_base != Decimal(order_msg.cumFilledQty):
+            # Update the relevant order information when there is fill event
+            new_filled_amount = Decimal(order_msg.cumFilledQty) - tracked_order.executed_amount_base
+            new_fee_paid = Decimal(order_msg.cumFee) - tracked_order.fee_paid
 
-        if tracked_order.is_cancelled:
-            self.logger().info(f"Successfully cancelled order {client_order_id}.")
-            self.trigger_event(MarketEvent.OrderCancelled,
-                               OrderCancelledEvent(
-                                   self.current_timestamp,
-                                   client_order_id,
-                                   exchange_order_id))
-            tracked_order.cancelled_event.set()
-            self.stop_tracking_order(client_order_id)
-        elif tracked_order.is_failure:
-            self.logger().info(f"The market order {client_order_id} has failed according to order status API. "
-                               f"Reason: {ascend_ex_utils.get_api_reason(order_msg.errorCode)}")
-            self.trigger_event(MarketEvent.OrderFailure,
-                               MarketOrderFailureEvent(
-                                   self.current_timestamp,
-                                   client_order_id,
-                                   tracked_order.order_type
-                               ))
-            self.stop_tracking_order(client_order_id)
-        elif tracked_order.is_done:
-            price = Decimal(order_msg.price)
             tracked_order.executed_amount_base = Decimal(order_msg.cumFilledQty)
-            tracked_order.executed_amount_quote = price * tracked_order.executed_amount_base
+            tracked_order.executed_amount_quote = Decimal(order_msg.avgPx) * tracked_order.executed_amount_base
             tracked_order.fee_paid = Decimal(order_msg.cumFee)
             tracked_order.fee_asset = order_msg.feeAsset
 
@@ -939,12 +981,33 @@ class AscendExExchange(ExchangeBase):
                     tracked_order.trading_pair,
                     tracked_order.trade_type,
                     tracked_order.order_type,
-                    price,
-                    tracked_order.executed_amount_base,
-                    TradeFee(0.0, [(tracked_order.fee_asset, tracked_order.fee_paid)]),
+                    Decimal(order_msg.avgPx),
+                    new_filled_amount,
+                    TradeFee(0.0, [(tracked_order.fee_asset, new_fee_paid)]),
                     exchange_order_id
                 )
             )
+
+        if tracked_order.is_cancelled:
+            self.logger().info(f"Successfully cancelled order {client_order_id}.")
+            self.trigger_event(MarketEvent.OrderCancelled,
+                               OrderCancelledEvent(
+                                   self.current_timestamp,
+                                   client_order_id,
+                                   exchange_order_id))
+            tracked_order.cancelled_event.set()
+            self.stop_tracking_order(client_order_id)
+        elif tracked_order.is_failure:
+            self.logger().info(f"Order {client_order_id} has failed according to order status API. "
+                               f"API order response: {order_msg}")
+            self.trigger_event(MarketEvent.OrderFailure,
+                               MarketOrderFailureEvent(
+                                   self.current_timestamp,
+                                   client_order_id,
+                                   tracked_order.order_type
+                               ))
+            self.stop_tracking_order(client_order_id)
+        elif tracked_order.is_filled:
             event_tag = MarketEvent.BuyOrderCompleted if tracked_order.trade_type is TradeType.BUY else MarketEvent.SellOrderCompleted
             event_class = BuyOrderCompletedEvent if tracked_order.trade_type is TradeType.BUY else SellOrderCompletedEvent
             self.trigger_event(
@@ -979,3 +1042,24 @@ class AscendExExchange(ExchangeBase):
         for asset_name in asset_names_to_remove:
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
+
+    def quantize_order_amount(self, trading_pair: str, amount: Decimal, price: Decimal = s_decimal_0) -> Decimal:
+        trading_rule: AscendExTradingRule = self._trading_rules[trading_pair]
+        quantized_amount: Decimal = super().quantize_order_amount(trading_pair, amount)
+
+        # Check against min_order_size and min_notional_size. If not passing either check, return 0.
+        if quantized_amount < trading_rule.min_order_size:
+            return s_decimal_0
+
+        if price == s_decimal_0:
+            current_price: Decimal = self.get_price(trading_pair, False)
+            notional_size = current_price * quantized_amount
+        else:
+            notional_size = price * quantized_amount
+
+        # Add 1% as a safety factor in case the prices changed while making the order.
+        if notional_size < trading_rule.min_notional_size * Decimal("1.01") or \
+                notional_size > trading_rule.max_notional_size:
+            return s_decimal_0
+
+        return quantized_amount

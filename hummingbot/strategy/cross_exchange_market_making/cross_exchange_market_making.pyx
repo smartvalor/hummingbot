@@ -30,7 +30,7 @@ from hummingbot.strategy.strategy_base import StrategyBase
 from .cross_exchange_market_pair import CrossExchangeMarketPair
 from .order_id_market_pair_tracker import OrderIDMarketPairTracker
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
-from hummingbot.client.performance import smart_round
+from hummingbot.client.performance import PerformanceMetrics
 
 NaN = float("nan")
 s_decimal_zero = Decimal(0)
@@ -61,26 +61,26 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             s_logger = logging.getLogger(__name__)
         return s_logger
 
-    def __init__(self,
-                 market_pairs: List[CrossExchangeMarketPair],
-                 min_profitability: Decimal,
-                 order_amount: Optional[Decimal] = Decimal("0.0"),
-                 order_size_taker_volume_factor: Decimal = Decimal("0.25"),
-                 order_size_taker_balance_factor: Decimal = Decimal("0.995"),
-                 order_size_portfolio_ratio_limit: Decimal = Decimal("0.1667"),
-                 limit_order_min_expiration: float = 130.0,
-                 adjust_order_enabled: bool = True,
-                 anti_hysteresis_duration: float = 60.0,
-                 active_order_canceling: bint = True,
-                 cancel_order_threshold: Decimal = Decimal("0.05"),
-                 top_depth_tolerance: Decimal = Decimal(0),
-                 logging_options: int = OPTION_LOG_ALL,
-                 status_report_interval: float = 900,
-                 use_oracle_conversion_rate: bool = False,
-                 taker_to_maker_base_conversion_rate: Decimal = Decimal("1"),
-                 taker_to_maker_quote_conversion_rate: Decimal = Decimal("1"),
-                 hb_app_notification: bool = False
-                 ):
+    def init_params(self,
+                    market_pairs: List[CrossExchangeMarketPair],
+                    min_profitability: Decimal,
+                    order_amount: Optional[Decimal] = Decimal("0.0"),
+                    order_size_taker_volume_factor: Decimal = Decimal("0.25"),
+                    order_size_taker_balance_factor: Decimal = Decimal("0.995"),
+                    order_size_portfolio_ratio_limit: Decimal = Decimal("0.1667"),
+                    limit_order_min_expiration: float = 130.0,
+                    adjust_order_enabled: bool = True,
+                    anti_hysteresis_duration: float = 60.0,
+                    active_order_canceling: bint = True,
+                    cancel_order_threshold: Decimal = Decimal("0.05"),
+                    top_depth_tolerance: Decimal = Decimal(0),
+                    logging_options: int = OPTION_LOG_ALL,
+                    status_report_interval: float = 900,
+                    use_oracle_conversion_rate: bool = False,
+                    taker_to_maker_base_conversion_rate: Decimal = Decimal("1"),
+                    taker_to_maker_quote_conversion_rate: Decimal = Decimal("1"),
+                    hb_app_notification: bool = False
+                    ):
         """
         Initializes a cross exchange market making strategy object.
 
@@ -109,7 +109,6 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         if not 0 <= order_size_taker_balance_factor <= 1:
             raise ValueError(f"order_size_taker_balance_factor must be between 0 and 1.")
 
-        super().__init__()
         self._market_pairs = {
             (market_pair.maker.market, market_pair.maker.trading_pair): market_pair
             for market_pair in market_pairs
@@ -147,6 +146,14 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             list all_markets = list(self._maker_markets | self._taker_markets)
 
         self.c_add_markets(all_markets)
+
+    @property
+    def order_amount(self):
+        return self._order_amount
+
+    @property
+    def min_profitability(self):
+        return self._min_profitability
 
     @property
     def active_limit_orders(self) -> List[Tuple[ExchangeBase, LimitOrder]]:
@@ -204,9 +211,9 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
         quote_pair, quote_rate_source, quote_rate, base_pair, base_rate_source, base_rate = \
             self.get_taker_to_maker_conversion_rate()
         if quote_pair.split("-")[0] != quote_pair.split("-")[1]:
-            self.logger().info(f"{quote_pair} ({quote_rate_source}) conversion rate: {smart_round(quote_rate)}")
+            self.logger().info(f"{quote_pair} ({quote_rate_source}) conversion rate: {PerformanceMetrics.smart_round(quote_rate)}")
         if base_pair.split("-")[0] != base_pair.split("-")[1]:
-            self.logger().info(f"{base_pair} ({base_rate_source}) conversion rate: {smart_round(base_rate)}")
+            self.logger().info(f"{base_pair} ({base_rate_source}) conversion rate: {PerformanceMetrics.smart_round(base_rate)}")
 
     def oracle_status_df(self):
         columns = ["Source", "Pair", "Rate"]
@@ -215,11 +222,11 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
             self.get_taker_to_maker_conversion_rate()
         if quote_pair.split("-")[0] != quote_pair.split("-")[1]:
             data.extend([
-                [quote_rate_source, quote_pair, smart_round(quote_rate)],
+                [quote_rate_source, quote_pair, PerformanceMetrics.smart_round(quote_rate)],
             ])
         if base_pair.split("-")[0] != base_pair.split("-")[1]:
             data.extend([
-                [base_rate_source, base_pair, smart_round(base_rate)],
+                [base_rate_source, base_pair, PerformanceMetrics.smart_round(base_rate)],
             ])
         return pd.DataFrame(data=data, columns=columns)
 
@@ -539,7 +546,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                     f"({limit_order_record.quantity} {limit_order_record.base_currency} @ "
                     f"{limit_order_record.price} {limit_order_record.quote_currency}) has been completely filled."
                 )
-                self.notify_hb_app(
+                self.notify_hb_app_with_timestamp(
                     f"Maker BUY order ({limit_order_record.quantity} {limit_order_record.base_currency} @ "
                     f"{limit_order_record.price} {limit_order_record.quote_currency}) is filled."
                 )
@@ -549,7 +556,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                     f"({market_pair.taker.trading_pair}) Taker buy order {order_id} for "
                     f"({order_completed_event.base_asset_amount} {order_completed_event.base_asset} has been completely filled."
                 )
-                self.notify_hb_app(
+                self.notify_hb_app_with_timestamp(
                     f"Taker buy order {order_completed_event.base_asset_amount} {order_completed_event.base_asset} is filled."
                 )
 
@@ -574,7 +581,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                     f"({limit_order_record.quantity} {limit_order_record.base_currency} @ "
                     f"{limit_order_record.price} {limit_order_record.quote_currency}) has been completely filled."
                 )
-                self.notify_hb_app(
+                self.notify_hb_app_with_timestamp(
                     f"Maker sell order ({limit_order_record.quantity} {limit_order_record.base_currency} @ "
                     f"{limit_order_record.price} {limit_order_record.quote_currency}) is filled."
                 )
@@ -584,7 +591,7 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
                     f"({market_pair.taker.trading_pair}) Taker sell order {order_id} for "
                     f"({order_completed_event.base_asset_amount} {order_completed_event.base_asset} has been completely filled."
                 )
-                self.notify_hb_app(
+                self.notify_hb_app_with_timestamp(
                     f"Taker sell order {order_completed_event.base_asset_amount} {order_completed_event.base_asset} is filled."
                 )
 
@@ -1328,5 +1335,4 @@ cdef class CrossExchangeMarketMakingStrategy(StrategyBase):
 
     def notify_hb_app(self, msg: str):
         if self._hb_app_notification:
-            from hummingbot.client.hummingbot_application import HummingbotApplication
-            HummingbotApplication.main_application()._notify(msg)
+            super().notify_hb_app(msg)
