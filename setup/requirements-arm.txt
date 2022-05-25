@@ -19,7 +19,7 @@ pre-commit==2.1.1
 prompt-toolkit==3.0.20
 psutil==5.7.2
 pyinstall==0.1.4
-pyjwt==1.7.1
+pyjwt==2.4.0
 pyperclip==1.7.0
 python-binance==0.7.5
 python-telegram-bot==12.4.2
